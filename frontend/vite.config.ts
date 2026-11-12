@@ -7,6 +7,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
+    // IPv4 explicitly: on macOS "localhost" resolves to IPv6 first, so without this the
+    // README's http://127.0.0.1:5173 address would not answer.
+    host: '127.0.0.1',
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8000',
