@@ -1,18 +1,24 @@
-"""Olist e-commerce pipeline: 7 raw tables → cleaned + merged → Postgres → analysis.
+"""Olist + IBGE pipeline: 2 independent datasets → cleaned + merged → Postgres → analysis.
 
-Question: which delivered orders end up with a bad review (score <= 2)?
+Problem: flag delivered orders that are likely to receive a bad review (score <= 2) so
+customer support can reach out first. Inputs:
+  * Olist Brazilian e-commerce (7 related tables: orders, customers, reviews, payments,
+    items, products, category translation)
+  * IBGE Brazilian Cities (independent public statistics: population, HDI, GDP per
+    capita, urban/rural type, coordinates) — joined to the customer's city
 
 Graph (TaskGroups in [brackets]; everything inside a group with no arrow between
 it runs in parallel on the LocalExecutor):
 
-    [ingest_and_clean]                       [transform]                 [load]
-      orders     : extract → clean  ─────┐
-      customers  : extract → clean  ─────┤
-      reviews    : extract → clean  ─────┼→ order_item_features ─┐
-      payments   : extract → clean  ─────┤                       ├→ merge_and_engineer → load_orders_clean → quality_checks
-      items      : extract → clean  ─────┘                       │
-      products   : extract_products ┐                             │
-                   extract_translation ┴→ clean ──────────────────┘
+    [ingest_and_clean]                                 [transform]                 [load]
+      orders     : extract → clean  ───────────────┐
+      customers  : extract → clean  ───────────────┤
+      cities     : extract → clean  (IBGE) ────────┤
+      reviews    : extract → clean  ───────────────┼──────────→ merge_and_engineer → load_orders_clean → quality_checks
+      payments   : extract → clean  ───────────────┤                 ↑
+      items      : extract → clean  ──┐            │                 │
+      products   : extract_products ┐ ├→ order_item_features ────────┘
+                   extract_translation ┴→ clean ┘
 
                                     [analysis]  (all three read from Postgres, in parallel)
     quality_checks ──→  make_charts │ train_models │ publish_for_agents  ──→ report
@@ -25,7 +31,9 @@ Connection ``warehouse_db`` (set via AIRFLOW_CONN_WAREHOUSE_DB in docker-compose
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -39,6 +47,7 @@ from airflow.utils.task_group import TaskGroup
 # ---------------------------------------------------------------------------
 REPO = Path("/repo")
 RAW = REPO / "datasets" / "olist" / "raw"
+CITIES_RAW = REPO / "datasets" / "brazil_cities" / "raw"
 OUT = REPO / "artifacts" / "airflow" / "olist"  # one sub-folder per run + latest/
 AGENT_CSV = REPO / "datasets" / "airflow" / "olist_orders_latest.csv"  # Part 2 input
 
@@ -83,7 +92,14 @@ SOURCES = {
         "product_category_name_translation.csv",
         ["product_category_name", "product_category_name_english"],
     ),
+    # Second, independent dataset (IBGE via Kaggle crisparada/brazilian-cities)
+    "cities": (
+        "BRAZIL_CITIES_REV2022.CSV",
+        ["CITY", "STATE", "CAPITAL", "IBGE_RES_POP", "IDHM", "IDHM_Renda", "IDHM_Educacao",
+         "GDP_CAPITA", "RURAL_URBAN", "LAT", "LONG"],
+    ),
 }
+SAO_PAULO = (-23.5505, -46.6333)  # most Olist sellers ship from SP state
 
 # Model inputs — no review_score / review dates / ids (that would leak the label)
 NUMERIC_FEATURES = [
@@ -93,13 +109,32 @@ NUMERIC_FEATURES = [
     "freight_ratio", "avg_product_weight_g", "avg_product_volume_cm3",
     "avg_product_photos", "payment_total", "n_payments", "max_installments",
     "used_voucher",
+    # from the IBGE cities dataset
+    "city_matched", "city_population_log", "city_hdi", "city_hdi_income",
+    "city_hdi_education", "city_gdp_per_capita", "city_is_capital", "city_distance_to_sp_km",
 ]
-CATEGORICAL_FEATURES = ["customer_state", "main_payment_type", "main_category"]
+CATEGORICAL_FEATURES = ["customer_state", "main_payment_type", "main_category", "city_rural_urban"]
+CITY_NUMERIC = ["city_population", "city_hdi", "city_hdi_income", "city_hdi_education",
+                "city_gdp_per_capita", "city_distance_to_sp_km"]
 
 # Chart styling (light surface, one sequential blue for single-series bars)
 INK, INK_2, MUTED, GRID, SURFACE, BLUE = (
     "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb", "#2a78d6",
 )
+
+
+def city_key(name) -> str:
+    """'São Paulo' and 'sao paulo' → 'sao paulo' (strip accents, punctuation, case)."""
+    txt = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode().lower()
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", txt).split())
+
+
+def _haversine_km(lat, lon, lat0, lon0):
+    import numpy as np
+
+    lat, lon, lat0, lon0 = map(np.radians, (lat, lon, lat0, lon0))
+    a = np.sin((lat - lat0) / 2) ** 2 + np.cos(lat) * np.cos(lat0) * np.sin((lon - lon0) / 2) ** 2
+    return 6371.0 * 2 * np.arcsin(np.sqrt(a))
 
 
 def _run_dir(context) -> Path:
@@ -128,7 +163,7 @@ def _save(df: pd.DataFrame, context, name: str, rows_in: int | None = None) -> d
 # ---------------------------------------------------------------------------
 @dag(
     dag_id="olist_pipeline",
-    description="Olist: 7 tables → clean (parallel) → merge → Postgres → charts + models",
+    description="Olist (7 tables) + IBGE cities → clean (parallel) → merge → Postgres → charts + models",
     # Daily at 06:00 UTC. catchup=False → unpausing runs only the latest interval,
     # not one run per day since start_date. max_active_runs=1 → runs never overlap
     # (they'd both replace olist.orders_clean).
@@ -137,7 +172,7 @@ def _save(df: pd.DataFrame, context, name: str, rows_in: int | None = None) -> d
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 1, "retry_delay": timedelta(minutes=1)},
-    tags=["olist", "assignment", "etl", "ml"],
+    tags=["olist", "ibge", "assignment", "etl", "ml"],
 )
 def olist_pipeline():
     # ------------------------------------------------------------------ extract
@@ -145,7 +180,7 @@ def olist_pipeline():
     def extract(table: str, **context) -> dict:
         """Read one raw CSV, enforce its column contract, stage it as parquet."""
         filename, required = SOURCES[table]
-        path = RAW / filename
+        path = (CITIES_RAW if table == "cities" else RAW) / filename
         if not path.is_file():
             raise FileNotFoundError(f"{path} — see datasets/olist/ATTRIBUTION.md")
         df = pd.read_csv(path, encoding="utf-8-sig")  # translation file has a BOM
@@ -198,9 +233,40 @@ def olist_pipeline():
         df["customer_state"] = df.customer_state.str.strip().str.upper()
         df["customer_city"] = df.customer_city.str.strip().str.lower()
         df["customer_zip_code_prefix"] = df.customer_zip_code_prefix.astype(str).str.zfill(5)
+        df["city_key"] = df.customer_city.map(city_key)
         keep = ["customer_id", "customer_unique_id", "customer_zip_code_prefix",
-                "customer_city", "customer_state"]
+                "customer_city", "customer_state", "city_key"]
         return _save(df[keep], context, "clean_customers", rows_in=n)
+
+    @task
+    def clean_cities(raw: dict, **context) -> dict:
+        """IBGE cities: normalized join key, 0-as-missing → NaN, dedupe, distance to São Paulo."""
+        import numpy as np
+
+        df = pd.read_parquet(raw["path"])
+        n = len(df)
+        df["city_key"] = df.CITY.map(city_key)
+        df["customer_state"] = df.STATE.str.strip().str.upper()
+        for c in ["IBGE_RES_POP", "IDHM", "IDHM_Renda", "IDHM_Educacao", "GDP_CAPITA", "LAT", "LONG"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").replace(0, np.nan)  # 0 = missing
+        df = (df.sort_values("IBGE_RES_POP", ascending=False)  # 4 duplicate keys → keep larger city
+                .drop_duplicates(["city_key", "customer_state"]))
+        rural = {"Urbano": "urban", "Intermediário Adjacente": "intermediate_adjacent",
+                 "Intermediário Remoto": "intermediate_remote", "Rural Adjacente": "rural_adjacent",
+                 "Rural Remoto": "rural_remote"}
+        out = pd.DataFrame({
+            "city_key": df.city_key,
+            "customer_state": df.customer_state,
+            "city_population": df.IBGE_RES_POP,
+            "city_hdi": df.IDHM,
+            "city_hdi_income": df.IDHM_Renda,
+            "city_hdi_education": df.IDHM_Educacao,
+            "city_gdp_per_capita": df.GDP_CAPITA,
+            "city_is_capital": pd.to_numeric(df.CAPITAL, errors="coerce").fillna(0).astype(int),
+            "city_rural_urban": df.RURAL_URBAN.map(rural).fillna("unknown"),
+            "city_distance_to_sp_km": _haversine_km(df.LAT, df.LONG, *SAO_PAULO),
+        })
+        return _save(out, context, "clean_cities", rows_in=n)
 
     @task
     def clean_reviews(raw: dict, **context) -> dict:
@@ -284,12 +350,16 @@ def olist_pipeline():
         return _save(agg.reset_index(), context, "order_item_features")
 
     @task
-    def merge_and_engineer(orders: dict, customers: dict, reviews: dict,
+    def merge_and_engineer(orders: dict, customers: dict, cities: dict, reviews: dict,
                            payments: dict, item_feats: dict, **context) -> dict:
-        """orders ⨝ customers ⨝ items ⨝ payments ⨝ reviews → one row per order + target."""
+        """orders ⨝ customers ⨝ IBGE cities ⨝ items ⨝ payments ⨝ reviews → one row per order."""
+        import numpy as np
+
         df = pd.read_parquet(orders["path"])
         n = len(df)
+        cty = pd.read_parquet(cities["path"])
         df = (df.merge(pd.read_parquet(customers["path"]), on="customer_id", how="inner")
+                .merge(cty, on=["city_key", "customer_state"], how="left", indicator="_city")
                 .merge(pd.read_parquet(item_feats["path"]), on="order_id", how="inner")
                 .merge(pd.read_parquet(payments["path"]), on="order_id", how="left")
                 .merge(pd.read_parquet(reviews["path"]), on="order_id", how="inner"))
@@ -300,6 +370,15 @@ def olist_pipeline():
         df["used_voucher"] = df.used_voucher.fillna(0).astype(int)
         df["main_payment_type"] = df.main_payment_type.fillna("unknown")
         df["freight_ratio"] = df.total_freight / df.total_price
+        # IBGE city context: ~0.6% of customers don't match (misspellings / districts)
+        # → fall back to the median of their state, then the national median.
+        df["city_matched"] = (df.pop("_city") == "both").astype(int)
+        state_med = cty.groupby("customer_state")[CITY_NUMERIC].median()
+        for c in CITY_NUMERIC:
+            df[c] = df[c].fillna(df.customer_state.map(state_med[c])).fillna(cty[c].median())
+        df["city_population_log"] = np.log1p(df.city_population)
+        df["city_is_capital"] = df.city_is_capital.fillna(0).astype(int)
+        df["city_rural_urban"] = df.city_rural_urban.fillna("unknown")
         df[TARGET] = (df.review_score <= 2).astype(int)
         if df.order_id.duplicated().any():
             raise ValueError("merge produced duplicate order_id rows")
@@ -326,11 +405,12 @@ def olist_pipeline():
         """Fail the run if the loaded table looks wrong (row count, nulls, label rate)."""
         hook = PostgresHook(postgres_conn_id=CONN_ID)
         any_null = " OR ".join(f"{c} IS NULL" for c in NUMERIC_FEATURES + CATEGORICAL_FEATURES)
-        rows, null_target, bad_rate, null_feat = hook.get_first(f"""
+        rows, null_target, bad_rate, null_feat, city_match = hook.get_first(f"""
             SELECT count(*),
                    count(*) FILTER (WHERE {TARGET} IS NULL),
                    avg({TARGET}::float),
-                   count(*) FILTER (WHERE {any_null})
+                   count(*) FILTER (WHERE {any_null}),
+                   avg(city_matched::float)
             FROM {SCHEMA}.{TABLE}""")
         problems = []
         if rows != loaded["rows"]:
@@ -341,9 +421,12 @@ def olist_pipeline():
             problems.append(f"nulls: target={null_target} features={null_feat}")
         if not 0.02 <= bad_rate <= 0.5:
             problems.append(f"bad-review rate {bad_rate:.3f} outside [0.02, 0.5]")
+        if city_match < 0.95:
+            problems.append(f"only {city_match:.1%} of orders matched an IBGE city (expected ≥ 95%)")
         if problems:
             raise ValueError("; ".join(problems))
-        return {"rows": rows, "bad_review_rate": round(bad_rate, 4)}
+        return {"rows": rows, "bad_review_rate": round(bad_rate, 4),
+                "city_match_rate": round(city_match, 4)}
 
     # ----------------------------------------------------------------- analysis
     @task
@@ -414,6 +497,38 @@ def olist_pipeline():
         fig.tight_layout()
         paths["states"] = str(out / "bad_review_rate_by_state.png")
         fig.savefig(paths["states"], dpi=150)
+        plt.close(fig)
+
+        # 3) bad-review rate by distance from São Paulo (IBGE coordinates)
+        dist = pd.read_sql(f"""
+            SELECT CASE WHEN city_distance_to_sp_km < 100 THEN 1
+                        WHEN city_distance_to_sp_km < 500 THEN 2
+                        WHEN city_distance_to_sp_km < 1000 THEN 3
+                        WHEN city_distance_to_sp_km < 2000 THEN 4 ELSE 5 END AS band,
+                   count(*) AS orders, avg({TARGET}::float) AS bad_rate,
+                   avg(is_late::float) AS late_rate
+            FROM {SCHEMA}.{TABLE} GROUP BY 1 ORDER BY 1""", eng)
+        band_lbl = {1: "< 100 km", 2: "100–500", 3: "500–1,000", 4: "1,000–2,000", 5: "2,000+ km"}
+        dist["label"] = [f"{band_lbl[b]}\nn={n:,}" for b, n in zip(dist.band, dist.orders)]
+        fig, ax = plt.subplots(figsize=(9, 4.8), facecolor=SURFACE)
+        ax.bar(dist.label, dist.bad_rate, color=BLUE, width=0.6, zorder=2)
+        ax.axhline(overall, color=MUTED, lw=1, ls="--", zorder=1)
+        ax.text(-0.45, overall + 0.006, f"all orders {overall:.1%}", ha="left", va="bottom",
+                fontsize=8.5, color=INK_2)
+        for x, (rate, late) in enumerate(zip(dist.bad_rate, dist.late_rate)):
+            ax.text(x, rate + 0.004, f"{rate:.1%}", ha="center", fontsize=10, color=INK)
+            ax.text(x, rate / 2, f"late {late:.0%}", ha="center", fontsize=8, color="white")
+        ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+        ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+        ax.set_ylim(0, dist.bad_rate.max() * 1.18)
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_major_locator(MultipleLocator(0.02))
+        style(ax, "Customers 1,000+ km from São Paulo leave more bad reviews",
+              "Bad-review rate by customer city's distance from São Paulo (IBGE coordinates) · "
+              "white = share delivered late")
+        fig.tight_layout()
+        paths["distance"] = str(out / "bad_review_rate_by_distance.png")
+        fig.savefig(paths["distance"], dpi=150)
         plt.close(fig)
 
         return {"charts": paths,
@@ -529,7 +644,7 @@ def olist_pipeline():
         summary = {
             "run_ts": context["ts"],
             "merge": {"delivered_orders_in": merged["rows_in"], "rows_out": merged["rows"]},
-            "warehouse": {"table": f"{SCHEMA}.{TABLE}", **dq},
+            "warehouse": {"table": f"{SCHEMA}.{TABLE}", **dq},  # includes city_match_rate
             "bad_review_rate_on_time": round(charts["on_time_bad_rate"], 4),
             "bad_review_rate_late": round(charts["late_bad_rate"], 4),
             "models": model["metrics"],
@@ -547,8 +662,8 @@ def olist_pipeline():
     # One sub-group per table: extract → clean. The sub-groups share no edges,
     # so the scheduler runs all of them at the same time.
     cleaners = {"orders": clean_orders, "customers": clean_customers,
-                "reviews": clean_reviews, "payments": clean_payments,
-                "items": clean_items}
+                "cities": clean_cities, "reviews": clean_reviews,
+                "payments": clean_payments, "items": clean_items}
     with TaskGroup("ingest_and_clean", tooltip="Extract + clean each table in parallel"):
         cleaned = {}
         for table, clean_fn in cleaners.items():
@@ -564,7 +679,7 @@ def olist_pipeline():
 
     with TaskGroup("transform"):
         feats = order_item_features(cleaned["items"], cleaned["products"])
-        merged = merge_and_engineer(cleaned["orders"], cleaned["customers"],
+        merged = merge_and_engineer(cleaned["orders"], cleaned["customers"], cleaned["cities"],
                                     cleaned["reviews"], cleaned["payments"], feats)
 
     with TaskGroup("load"):

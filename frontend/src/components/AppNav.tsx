@@ -2,9 +2,7 @@ import { Link, useLocation } from 'react-router-dom'
 
 const LINKS = [
   { to: '/', label: 'Projects' },
-  { to: '/guide', label: 'Guide' },
-  { to: '/student-loop', label: 'Build Loop' },
-  { to: '/simple-loop', label: 'Simple Loop' },
+  { to: '/simple-loop', label: 'In-class loop (baseline)' },
   { to: '/olist-loop', label: 'Olist Loop' },
 ]
 

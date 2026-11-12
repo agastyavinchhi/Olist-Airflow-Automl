@@ -1168,7 +1168,7 @@ def olist_loop_list_runs(limit: int = Query(default=50, ge=1, le=50)) -> dict:
 @app.get("/olist-loop/stream")
 async def olist_loop_stream(
     target_score: float = Query(default=0.5, ge=0.0, le=1.0),
-    max_cycles: int = Query(default=3, ge=1, le=6),
+    max_cycles: int = Query(default=5, ge=1, le=8),
     max_rows: int = Query(default=0, ge=0),
     seed: int = Query(default=42),
     model: str | None = Query(default=None),

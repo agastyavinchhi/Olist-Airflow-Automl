@@ -1,1 +1,1 @@
-"""Olist bad-review research loop (Part 2) — adapted from mini_loop."""
+"""Olist bad-review risk agents (Part 2): diagnosis-routed LangGraph loop over olist.orders_clean."""

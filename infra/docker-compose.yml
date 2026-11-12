@@ -70,7 +70,6 @@ services:
       PROJECT_DATA_DIR: /data/projects
       SIMPLE_LOOP_RUNS_PATH: /data/simple_loop/runs.json
       MINI_LOOP_ROOT: /mini_loop
-      STUDENT_LOOP_ROOT: /student_loop
       # Part 2 Olist loop: reads olist.orders_clean written by the Airflow DAG
       OLIST_LOOP_ROOT: /olist_loop
       WAREHOUSE_URL: postgresql+psycopg2://${WAREHOUSE_USER:-warehouse}:${WAREHOUSE_PASSWORD:-warehouse}@warehouse-db:5432/${WAREHOUSE_DB:-warehouse}
@@ -81,7 +80,6 @@ services:
       # rw so uploaded CSVs can be reused via the prior-datasets dropdown
       - ../datasets:/bundled
       - ../mini_loop:/mini_loop
-      - ../student_loop:/student_loop
       - ../olist_loop:/olist_loop
       # Shared LLM/train helpers imported by both graphs (not a student paste target)
       - ../loop_runtime.py:/app/loop_runtime.py
@@ -400,22 +398,6 @@ services:
     volumes: *airflow-common-volumes
     user: "50000:0"
     command: scheduler
-    networks: [automl]
-
-  # One-shot Docker runner for prep without opening the UI (still containerized).
-  airflow-prep-once:
-    profiles: ["airflow"]
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile.airflow
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-    environment: *airflow-common-env
-    volumes: *airflow-common-volumes
-    user: "0:0"
-    working_dir: /repo
-    entrypoint: ["python", "-m", "mini_loop.baseline"]
     networks: [automl]
 
 networks:

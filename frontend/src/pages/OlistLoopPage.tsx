@@ -34,15 +34,25 @@ type Holdout = Metrics & {
   recipes?: string[]
   hyperparameters?: Record<string, unknown>
   airflow_baselines?: Baselines | null
+  route_log?: string[]
+  stop_reason?: string
+  best_cycle?: number
 }
 type Step = {
   node?: string
   note?: string
   used_llm?: boolean
   output?: Record<string, unknown>
-  verdict?: { action?: string; observation?: string; next_action?: string }
+  verdict?: { route?: string; reason?: string; diagnosis?: string; stop?: string | null; action?: string }
   metrics?: Holdout
-  spec?: { model_family?: string; hyperparameters?: Record<string, unknown>; threshold_strategy?: string }
+  spec?: { model_family?: string; hyperparameters?: Record<string, unknown>; threshold?: string }
+}
+type EvalOutput = {
+  validation?: Metrics
+  recipes?: string[]
+  diagnosis?: string
+  recommended_route?: string
+  reason?: string
 }
 type StreamEvent = {
   type: string
@@ -50,6 +60,7 @@ type StreamEvent = {
   note?: string | null
   action?: string
   route?: string
+  reason?: string
   message?: string
   step?: Step
   cycle?: number
@@ -59,12 +70,13 @@ type StreamEvent = {
 type ExperimentRow = {
   cycle: number
   family?: string
+  threshold?: string
   recipes?: string[]
   hp?: Record<string, unknown>
   validation?: Metrics
-  f1At05?: number
-  verdict?: string
-  observation?: string
+  diagnosis?: string
+  route?: string
+  reason?: string
 }
 type LogLine = { t: string; node: string; note: string; llm?: boolean }
 
@@ -88,19 +100,12 @@ function rowsFromSteps(steps: Step[] = []): ExperimentRow[] {
   for (const s of steps) {
     if (s.node === 'ml_engineer') {
       cycle += 1
-      rows.push({ cycle, family: s.spec?.model_family, hp: s.spec?.hyperparameters })
+      rows.push({ cycle, family: s.spec?.model_family, threshold: s.spec?.threshold, hp: s.spec?.hyperparameters })
     } else if (s.node === 'evaluator' && rows.length) {
-      const o = (s.output ?? {}) as { validation?: Metrics; recipes?: string[]; 'f1_at_0.5'?: number }
-      Object.assign(rows[rows.length - 1], {
-        validation: o.validation,
-        recipes: o.recipes,
-        f1At05: o['f1_at_0.5'],
-      })
+      const o = (s.output ?? {}) as EvalOutput
+      Object.assign(rows[rows.length - 1], { validation: o.validation, recipes: o.recipes, diagnosis: o.diagnosis })
     } else if (s.node === 'judge' && rows.length) {
-      Object.assign(rows[rows.length - 1], {
-        verdict: s.verdict?.action,
-        observation: s.verdict?.observation,
-      })
+      Object.assign(rows[rows.length - 1], { route: s.verdict?.route, reason: s.verdict?.reason })
     }
   }
   return rows
@@ -121,7 +126,22 @@ function Panel({ title, sub, children }: { title: string; sub?: string; children
   )
 }
 
-function ExperimentsTable({ rows, target, airflowF1 }: { rows: ExperimentRow[]; target: number; airflowF1?: number }) {
+const ROUTE_STYLE: Record<string, string> = {
+  features: 'border-teal/50 text-teal',
+  model: 'border-paper/40 text-paper',
+  rethink: 'border-danger/40 text-danger',
+  finish: 'border-ok/50 text-ok',
+}
+
+function RouteChip({ route }: { route?: string }) {
+  return (
+    <span className={`rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase ${ROUTE_STYLE[route ?? ''] ?? 'border-line text-mist'}`}>
+      {route ?? '…'}
+    </span>
+  )
+}
+
+function ExperimentsTable({ rows }: { rows: ExperimentRow[] }) {
   if (rows.length === 0) return <p className="text-sm text-mist">No experiments yet — run the loop.</p>
   const best = Math.max(...rows.map((r) => r.validation?.f1 ?? -1))
   return (
@@ -132,40 +152,33 @@ function ExperimentsTable({ rows, target, airflowF1 }: { rows: ExperimentRow[]; 
             <th className="py-1 pr-2">#</th>
             <th className="pr-2">Model · features</th>
             <th className="pr-2 text-right">Val F1</th>
-            <th className="pr-2 text-right">Acc</th>
             <th className="pr-2 text-right">AUC</th>
             <th className="pr-2 text-right">Thr</th>
-            <th>Judge</th>
+            <th className="pr-2">Diagnosis</th>
+            <th>Route</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => {
             const f1 = r.validation?.f1
-            const isBest = f1 != null && f1 === best
             return (
-              <tr key={r.cycle} className="border-b border-line/60 align-top">
+              <tr key={r.cycle} className="border-b border-line/60 align-top" title={r.reason}>
                 <td className="py-1.5 pr-2 font-mono text-mist">{r.cycle}</td>
                 <td className="pr-2">
-                  <p className="text-paper">{r.family?.replace(/_/g, ' ') ?? '…'}</p>
-                  <p className="text-[10px] text-mist">{(r.recipes ?? []).join(', ') || 'no recipes'}</p>
+                  <p className="text-paper">
+                    {r.family?.replace(/_/g, ' ') ?? '…'}
+                    {r.threshold === 'tune_f1' && <span className="ml-1 text-[10px] text-mist">· tuned cutoff</span>}
+                  </p>
+                  <p className="text-[10px] text-mist">{(r.recipes ?? []).join(', ') || 'base columns'}</p>
                 </td>
-                <td className={`pr-2 text-right font-mono ${isBest ? 'font-semibold text-teal' : 'text-paper'}`}>
+                <td className={`pr-2 text-right font-mono ${f1 != null && f1 === best ? 'font-semibold text-teal' : 'text-paper'}`}>
                   {fmt(f1)}
-                  {typeof r.f1At05 === 'number' && r.validation?.threshold !== 0.5 && (
-                    <span className="block text-[10px] font-normal text-mist">@0.5: {fmt(r.f1At05)}</span>
-                  )}
                 </td>
-                <td className="pr-2 text-right font-mono text-paper">{fmt(r.validation?.accuracy)}</td>
                 <td className="pr-2 text-right font-mono text-paper">{fmt(r.validation?.roc_auc)}</td>
                 <td className="pr-2 text-right font-mono text-mist">{fmt(r.validation?.threshold, 2)}</td>
+                <td className="pr-2 font-mono text-[10px] text-mist">{r.diagnosis?.replace(/_/g, ' ') ?? '…'}</td>
                 <td>
-                  <span
-                    className={`rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase ${
-                      r.verdict === 'accept' ? 'border-ok/40 text-ok' : 'border-line text-mist'
-                    }`}
-                  >
-                    {r.verdict ?? '…'}
-                  </span>
+                  <RouteChip route={r.route} />
                 </td>
               </tr>
             )
@@ -173,11 +186,67 @@ function ExperimentsTable({ rows, target, airflowF1 }: { rows: ExperimentRow[]; 
         </tbody>
       </table>
       <p className="mt-2 text-[11px] text-mist">
-        Target val F1 {target.toFixed(2)}
-        {airflowF1 != null ? ` · Airflow random forest F1 ${airflowF1.toFixed(3)}` : ''} · thresholds tuned on
-        validation when the ML Engineer picks <span className="font-mono">tune_f1</span>
+        weak ranking → <b>features</b> · ranking OK, F1 low → <b>model</b> · same fix failed twice → <b>rethink</b> ·
+        target / plateau / budget → <b>finish</b>. Hover a row for the judge&apos;s reason.
       </p>
     </div>
+  )
+}
+
+/** Validation F1 per cycle, with the route taken after it, the target and Airflow's F1. */
+function LearningCurve({ rows, target, airflowF1 }: { rows: ExperimentRow[]; target: number; airflowF1?: number }) {
+  const pts = rows.filter((r) => typeof r.validation?.f1 === 'number')
+  if (pts.length === 0) return <p className="text-sm text-mist">Plots after the first evaluation.</p>
+  const W = 520, H = 220, L = 44, R = 40, T = 16, B = 34
+  const vals = [...pts.map((r) => r.validation!.f1), target, airflowF1 ?? target]
+  const lo = Math.floor((Math.min(...vals) - 0.02) * 50) / 50
+  const hi = Math.ceil((Math.max(...vals) + 0.02) * 50) / 50
+  const x = (i: number) => L + (pts.length === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (pts.length - 1))
+  const y = (v: number) => T + ((hi - v) * (H - T - B)) / (hi - lo)
+  const ticks = Array.from({ length: Math.round((hi - lo) / 0.02) + 1 }, (_, i) => lo + i * 0.02)
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Validation F1 by cycle">
+      {ticks.map((t) => (
+        <g key={t}>
+          <line x1={L} x2={W - R} y1={y(t)} y2={y(t)} stroke="currentColor" className="text-line" strokeWidth={0.6} />
+          <text x={L - 6} y={y(t) + 3} textAnchor="end" className="fill-mist font-mono" fontSize={9}>
+            {t.toFixed(2)}
+          </text>
+        </g>
+      ))}
+      <line x1={L} x2={W - R} y1={y(target)} y2={y(target)} stroke="#0d8f6e" strokeDasharray="5 4" strokeWidth={1.2} />
+      <text x={L + 4} y={y(target) - 4} textAnchor="start" fontSize={9} className="fill-teal">
+        target {target.toFixed(2)}
+      </text>
+      {airflowF1 != null && (
+        <>
+          <line x1={L} x2={W - R} y1={y(airflowF1)} y2={y(airflowF1)} stroke="#898781" strokeDasharray="2 3" strokeWidth={1} />
+          <text x={L + 4} y={y(airflowF1) + 11} textAnchor="start" fontSize={9} className="fill-mist">
+            Airflow RF {airflowF1.toFixed(3)}
+          </text>
+        </>
+      )}
+      <polyline
+        fill="none"
+        stroke="#2a78d6"
+        strokeWidth={2}
+        points={pts.map((r, i) => `${x(i)},${y(r.validation!.f1)}`).join(' ')}
+      />
+      {pts.map((r, i) => (
+        <g key={r.cycle}>
+          <circle cx={x(i)} cy={y(r.validation!.f1)} r={4.5} fill="#2a78d6" stroke="white" strokeWidth={2} />
+          <text x={x(i)} y={y(r.validation!.f1) - 9} textAnchor="middle" fontSize={9} className="fill-paper font-mono">
+            {r.validation!.f1.toFixed(3)}
+          </text>
+          <text x={x(i)} y={H - 18} textAnchor="middle" fontSize={9} className="fill-mist font-mono">
+            cycle {r.cycle}
+          </text>
+          <text x={x(i)} y={H - 6} textAnchor="middle" fontSize={9} className="fill-teal font-mono">
+            {r.route ? `→ ${r.route}` : ''}
+          </text>
+        </g>
+      ))}
+    </svg>
   )
 }
 
@@ -254,6 +323,13 @@ function FinalEvaluation({ h }: { h: Holdout | null }) {
             <span className="font-mono text-paper">{fmt(h.pr_auc)}</span>
           </p>
           <p className="mt-1">Features: {(h.recipes ?? []).join(', ') || 'base columns only'}</p>
+          {h.route_log && (
+            <p className="mt-1">
+              Route path:{' '}
+              <span className="font-mono text-paper">{h.route_log.join(' → ')}</span>
+              {h.stop_reason ? ` (${h.stop_reason})` : ''} · best = cycle {h.best_cycle}
+            </p>
+          )}
           <p className="mt-1 font-mono text-[10px]">{JSON.stringify(h.hyperparameters)}</p>
           <p className="mt-2">
             Airflow rows come from <span className="font-mono">olist.model_runs</span> (its own 20% test split);
@@ -275,7 +351,7 @@ export function OlistLoopPage() {
   const [models, setModels] = useState<SimpleLoopModel[]>([])
   const [modelId, setModelId] = useState('')
   const [targetScore, setTargetScore] = useState(0.5)
-  const [maxCycles, setMaxCycles] = useState(3)
+  const [maxCycles, setMaxCycles] = useState(5)
   const [maxRows, setMaxRows] = useState(0)
   const [runtime, setRuntime] = useState<SimpleLoopRuntime>({})
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null)
@@ -300,8 +376,8 @@ export function OlistLoopPage() {
     void (async () => {
       try {
         const cat = await listSimpleLoopModels()
-        // Free OpenRouter models + Cursor SDK only — no accidental paid calls.
-        const list = (cat.models ?? []).filter((m) => m.free || m.provider === 'cursor')
+        // Free OpenRouter models only (the loop's own client is OpenRouter-only) — no paid calls.
+        const list = (cat.models ?? []).filter((m) => m.free && m.provider !== 'cursor')
         setModels(list)
         setModelId(cat.default || list[0]?.id || '')
       } catch {
@@ -379,8 +455,8 @@ export function OlistLoopPage() {
         return
       }
       if (ev.type === 'router') {
-        setRuntime((p) => setStatus(p, 'router', 'completed', `route → ${ev.route} (${ev.action})`))
-        setLog((l) => [...l, { t: now(), node: 'router', note: `→ ${ev.route} (${ev.action})` }])
+        setRuntime((p) => setStatus(p, 'router', 'completed', `route → ${ev.route}: ${ev.reason ?? ''}`))
+        setLog((l) => [...l, { t: now(), node: 'router', note: `→ ${ev.route} · ${ev.reason ?? ''}` }])
         return
       }
       if (ev.type === 'node_completed' && ev.node) {
@@ -396,23 +472,30 @@ export function OlistLoopPage() {
         if (node === 'ml_engineer') {
           setRows((r) => [
             ...r,
-            { cycle: (ev.cycle as number) ?? r.length + 1, family: step.spec?.model_family, hp: step.spec?.hyperparameters },
+            {
+              cycle: (ev.cycle as number) ?? r.length + 1,
+              family: step.spec?.model_family,
+              threshold: step.spec?.threshold,
+              hp: step.spec?.hyperparameters,
+            },
           ])
         }
         if (node === 'evaluator') {
-          const o = (step.output ?? {}) as { validation?: Metrics; recipes?: string[]; 'f1_at_0.5'?: number }
+          const o = (step.output ?? {}) as EvalOutput
           setRows((r) =>
             r.map((row, i) =>
-              i === r.length - 1 ? { ...row, validation: o.validation, recipes: o.recipes, f1At05: o['f1_at_0.5'] } : row,
+              i === r.length - 1 ? { ...row, validation: o.validation, recipes: o.recipes, diagnosis: o.diagnosis } : row,
             ),
           )
         }
         if (node === 'judge') {
           setRows((r) =>
-            r.map((row, i) =>
-              i === r.length - 1 ? { ...row, verdict: step.verdict?.action, observation: step.verdict?.observation } : row,
-            ),
+            r.map((row, i) => (i === r.length - 1 ? { ...row, route: step.verdict?.route, reason: step.verdict?.reason } : row)),
           )
+        }
+        if (node === 'research_memory') {
+          const tgt = (step.output as { next?: string } | undefined)?.next ?? ''
+          if (tgt) setRuntime((p) => setStatus(p, 'research_memory', 'completed', `dispatch → ${tgt}`))
         }
         if (node === 'holdout_eval' && step.metrics) {
           setHoldout(step.metrics)
@@ -448,10 +531,10 @@ export function OlistLoopPage() {
       <header className="flex flex-wrap items-end justify-between gap-4 border-b border-line px-6 py-4">
         <div className="min-w-0">
           <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-teal">Part 2 · agent workflow</p>
-          <h1 className="font-display text-3xl font-semibold text-paper">Olist bad-review loop</h1>
+          <h1 className="font-display text-3xl font-semibold text-paper">Olist bad-review risk agents</h1>
           <p className="mt-1 text-sm text-mist">
-            Predict review score ≤ 2 from <span className="font-mono">olist.orders_clean</span> (loaded by the Airflow
-            DAG) · 9 agents · live SSE{cycle > 0 ? ` · cycle ${cycle}` : ''}
+            Flag orders likely to get a 1–2★ review · data: <span className="font-mono">olist.orders_clean</span> (Olist +
+            IBGE cities, loaded by Airflow) · 9 agents · diagnosis-routed loop{cycle > 0 ? ` · cycle ${cycle}` : ''}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -464,6 +547,7 @@ export function OlistLoopPage() {
               className="max-w-[16rem] border border-line bg-ink-2 px-2 py-1.5 font-mono text-xs text-paper"
             >
               {models.length === 0 && <option value="">gateway default</option>}
+              <option value="none">Heuristics only (no LLM)</option>
               {models.map((m) => (
                 <option key={m.id} value={m.id} disabled={m.available === false}>
                   {m.name}
@@ -539,8 +623,11 @@ export function OlistLoopPage() {
           </Panel>
         </div>
         <div className="flex min-w-0 flex-col gap-6">
+          <Panel title="Learning curve" sub="Validation F1 per cycle · route the judge took next">
+            <LearningCurve rows={rows} target={targetScore} airflowF1={airflowF1} />
+          </Panel>
           <Panel title="Experiments" sub="One row per cycle · validation split">
-            <ExperimentsTable rows={rows} target={targetScore} airflowF1={airflowF1} />
+            <ExperimentsTable rows={rows} />
           </Panel>
           <Panel title="Agent log" sub="What each agent reported (LLM calls marked)">
             {log.length === 0 ? (
