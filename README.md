@@ -17,8 +17,9 @@ It combines **two independent datasets**:
 - **Part 1:** an **Airflow** DAG, built from scratch. It runs on a daily schedule, ingests both
   datasets, cleans 7 tables in parallel TaskGroups, joins them, loads the result into
   **PostgreSQL**, then reads it back to make charts and train two models.
-- **Part 2:** a **LangGraph multi-agent loop** with my own graph and my own looping logic. An
-  evaluator agent **diagnoses** each experiment, and the diagnosis decides which agent the work
+- **Part 2:** a **fresh multi-agent architecture** that I designed and built from scratch in
+  LangGraph: my own graph, agents, routing and LLM client. It doesn't reuse the class loop's code
+  or structure. An evaluator agent **diagnoses** each experiment, and the diagnosis decides which agent the work
   goes back to: feature engineer, ML engineer, or strategist. It can also stop early. A new UI
   page shows the live graph, the route taken each cycle, a learning curve and the final
   evaluation.
@@ -39,7 +40,7 @@ It combines **two independent datasets**:
 | Analysis | 4 charts + logistic regression / random forest, logged to `olist.model_runs` | [§ Results](#analysis-results) |
 | **1.4** Document process, scheduling, parallelism | this README | [§ Part 1](#part-1--airflow-pipeline) |
 | **2** Agent workflow trained/evaluated on Part 1's data | [`olist_loop/`](olist_loop/) reads `olist.orders_clean` | [§ Part 2](#part-2--diagnosis-routed-agent-loop) |
-| Add / remove / modify agents | 9 agents, routing designed for this problem | [§ Agents](#agents) |
+| Add / remove / modify agents | **Fresh architecture designed from scratch:** 9 agents with their own roles and diagnosis-based routing, replacing the class loop rather than modifying it | [§ Agents](#agents) |
 | Update the live agent graph | [`olistLoopConfig.ts`](frontend/src/graph/olistLoopConfig.ts), page `/olist-loop` | [Live graph](docs/images/olist/olist-agent-graph-running.png) |
 | Report accuracy / appropriate metric | accuracy, precision, recall, **F1**, ROC-AUC, PR-AUC, confusion matrix | [Final evaluation](docs/images/olist/olist-agent-final-eval.png) |
 | **Submission** repo + run instructions | this repo | [§ How to run](#how-to-run) |
@@ -255,10 +256,25 @@ of the time. Late orders get one **54.1%** of the time, and orders more than a w
 
 ## Part 2 — Diagnosis-routed agent loop
 
-### Why a different design from the class loop
+### A fresh architecture, not a modified class loop
 
-The in-class loop (kept unchanged as the baseline at `/simple-loop`) always runs the same cycle:
-hypothesis → train → judge → *revise* → hypothesis. Every failure gets the same treatment.
+I designed this agent system from scratch for the bad-review problem. It doesn't import or adapt
+the class loop's code, and its graph has a different structure. The in-class loop is kept
+unchanged in the repo **only as a comparison baseline** (`/simple-loop`). It always runs the same
+cycle: hypothesis → train → judge → *revise* → hypothesis, so every failure gets the same
+treatment.
+
+| | In-class loop (baseline) | My architecture |
+|---|---|---|
+| Loop structure | one fixed revise path back to the hypothesis agent | **3 different loop-back targets** (feature engineer, ML engineer, strategist) + early stop |
+| Who decides the route | judge accept / revise | **evaluator diagnosis** (code) → judge picks from the allowed routes |
+| Data source | any uploaded CSV | **Postgres table written by my Airflow DAG**, plus the Airflow models' scores as baselines |
+| Agents | data scientist, hypothesis generator, ML engineer, judge, memory writer, context builder, holdout | **warehouse loader, data scientist, strategist, feature engineer, ML engineer, evaluator, judge, research memory, holdout** |
+| Features | none (raw columns) | **feature engineer** with a fixed recipe menu, including IBGE city features |
+| Imbalance handling | class weights only | class weights + **F1-tuned decision threshold** |
+| Stopping | target met or budget spent | target met, budget spent, or **plateau early-stop** |
+| LLM client | shared template helper | **my own client** with JSON extraction, retries, a quota circuit breaker and a heuristics-only mode |
+| Output | in-memory result | holdout metrics + route path **logged to Postgres** (`olist.agent_runs`) |
 
 My problem gives a clearer signal about **why** a model falls short:
 - If **ROC-AUC** isn't better than the baseline, the model can't separate good from bad orders. It
@@ -293,6 +309,8 @@ set**.
 | the same fix didn't improve twice in a row | stuck | **rethink** → strategist (whole new plan: new family + feature set) |
 
 ### Agents
+
+All 9 agents were written from scratch for this architecture.
 
 | Agent | Type | Responsibility |
 |---|---|---|
@@ -410,7 +428,7 @@ forwards ports 8088 / 8000 / 5173 / 5433 and creates `.env`. Open the repo in VS
 |---|---|
 | [`airflow/dags/olist_pipeline.py`](airflow/dags/olist_pipeline.py): the whole pipeline | Docker Compose stack, Airflow image base, Makefile targets |
 | [`datasets/olist/`](datasets/olist/), [`datasets/brazil_cities/`](datasets/brazil_cities/): both datasets + profiling notes | React Flow canvas component (I made it accept any graph config) |
-| [`olist_loop/`](olist_loop/): graph, 9 agents, diagnosis routing, LLM client, CLI | gateway service skeleton (I added `/olist-loop/*` endpoints) |
+| [`olist_loop/`](olist_loop/): **fresh agent architecture built from scratch**: graph, 9 agents, diagnosis routing, own LLM client, CLI | gateway service skeleton (I added `/olist-loop/*` endpoints) |
 | `warehouse-db`, the `warehouse_db` Airflow connection, quality checks | `mini_loop/` + `/simple-loop`: the in-class loop, **kept unchanged as the comparison baseline** |
 | [`frontend/src/pages/OlistLoopPage.tsx`](frontend/src/pages/OlistLoopPage.tsx), [`olistLoopConfig.ts`](frontend/src/graph/olistLoopConfig.ts) | template backend services the stack starts |
 
