@@ -1,0 +1,14 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3
+httpx>=0.27
+python-multipart>=0.0.9
+redis>=5.0
+# Simple research loop (mini_loop LangGraph teaching path)
+pandas>=2.2
+scikit-learn>=1.4
+langgraph>=0.2
+cursor-sdk>=0.1.0
+# Olist loop (Part 2) reads the Airflow-loaded warehouse table
+sqlalchemy>=2.0
+psycopg2-binary>=2.9

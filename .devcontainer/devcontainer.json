@@ -1,0 +1,30 @@
+// Dev container for the Olist pipeline + agent loop.
+// Everything that runs (Airflow, Postgres, gateway, agents) is already in Docker via
+// infra/docker-compose.yml; this container gives you the matching toolchain
+// (Python 3.12, Node 20, Docker CLI talking to the host daemon, make, psql) so
+// `make airflow` / `make start-mac` work the same on every machine.
+{
+  "name": "olist-automl-lab",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  // Same path inside and outside → docker-compose's relative bind mounts
+  // (e.g. `..:/repo`) resolve correctly on the host Docker daemon.
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "forwardPorts": [8088, 8000, 5173, 5433],
+  "portsAttributes": {
+    "8088": { "label": "Airflow UI" },
+    "8000": { "label": "Gateway API" },
+    "5173": { "label": "Web UI (/olist-loop)" },
+    "5433": { "label": "Warehouse Postgres" }
+  },
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql-client make && test -f .env || cp .env.example .env && npm --prefix frontend install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-azuretools.vscode-docker", "dbaeumer.vscode-eslint"]
+    }
+  }
+}
