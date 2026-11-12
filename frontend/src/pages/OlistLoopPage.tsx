@@ -197,11 +197,12 @@ function ExperimentsTable({ rows }: { rows: ExperimentRow[] }) {
 function LearningCurve({ rows, target, airflowF1 }: { rows: ExperimentRow[]; target: number; airflowF1?: number }) {
   const pts = rows.filter((r) => typeof r.validation?.f1 === 'number')
   if (pts.length === 0) return <p className="text-sm text-mist">Plots after the first evaluation.</p>
-  const W = 520, H = 220, L = 44, R = 40, T = 16, B = 34
+  const W = 520, H = 236, L = 44, R = 40, T = 34, B = 34
   const vals = [...pts.map((r) => r.validation!.f1), target, airflowF1 ?? target]
   const lo = Math.floor((Math.min(...vals) - 0.02) * 50) / 50
   const hi = Math.ceil((Math.max(...vals) + 0.02) * 50) / 50
-  const x = (i: number) => L + (pts.length === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (pts.length - 1))
+  const PAD = 30 // keep the first/last point and its label clear of the axis and edge
+  const x = (i: number) => L + PAD + (pts.length === 1 ? (W - L - R - 2 * PAD) / 2 : (i * (W - L - R - 2 * PAD)) / (pts.length - 1))
   const y = (v: number) => T + ((hi - v) * (H - T - B)) / (hi - lo)
   const ticks = Array.from({ length: Math.round((hi - lo) / 0.02) + 1 }, (_, i) => lo + i * 0.02)
   return (
@@ -215,14 +216,19 @@ function LearningCurve({ rows, target, airflowF1 }: { rows: ExperimentRow[]; tar
         </g>
       ))}
       <line x1={L} x2={W - R} y1={y(target)} y2={y(target)} stroke="#0d8f6e" strokeDasharray="5 4" strokeWidth={1.2} />
-      <text x={L + 4} y={y(target) - 4} textAnchor="start" fontSize={9} className="fill-teal">
-        target {target.toFixed(2)}
+      {airflowF1 != null && (
+        <line x1={L} x2={W - R} y1={y(airflowF1)} y2={y(airflowF1)} stroke="#898781" strokeDasharray="2 3" strokeWidth={1} />
+      )}
+      {/* legend for the reference lines, above the plot so it never collides with points */}
+      <line x1={L} x2={L + 22} y1={10} y2={10} stroke="#0d8f6e" strokeDasharray="5 4" strokeWidth={1.2} />
+      <text x={L + 28} y={13} fontSize={9} className="fill-teal">
+        target F1 {target.toFixed(2)}
       </text>
       {airflowF1 != null && (
         <>
-          <line x1={L} x2={W - R} y1={y(airflowF1)} y2={y(airflowF1)} stroke="#898781" strokeDasharray="2 3" strokeWidth={1} />
-          <text x={L + 4} y={y(airflowF1) + 11} textAnchor="start" fontSize={9} className="fill-mist">
-            Airflow RF {airflowF1.toFixed(3)}
+          <line x1={L + 130} x2={L + 152} y1={10} y2={10} stroke="#898781" strokeDasharray="2 3" strokeWidth={1} />
+          <text x={L + 158} y={13} fontSize={9} className="fill-mist">
+            Airflow random forest F1 {airflowF1.toFixed(3)}
           </text>
         </>
       )}

@@ -348,34 +348,34 @@ The page at **`/olist-loop`** ([`OlistLoopPage.tsx`](frontend/src/pages/OlistLoo
 
 ### Evaluation results
 
-These screenshots and numbers come from a **heuristics-only run** (`--model none`), because the
-free OpenRouter quota (50 LLM requests per day) was used up during development. Every agent then
-uses its coded fallback; the diagnosis and routing logic are exactly the same as with an LLM.
-All runs are logged in `olist.agent_runs`.
+These screenshots and numbers come from a run with the free LLM `nvidia/nemotron-3.5-lightning:free`.
+**All 10 LLM agent calls returned valid decisions:** data scientist ×1, strategist ×2, feature
+engineer ×2, ML engineer ×3, judge ×2. The last judge step was decided by rule, because "finish"
+was the only allowed route. Every run is logged in `olist.agent_runs`.
 
 | Cycle | What the agents did | Val F1 | Val AUC | Diagnosis → route |
 |---|---|---|---|---|
-| 1 | logistic regression + lateness buckets | 0.440 | 0.760 | weak ranking → **features** |
-| 2 | + delivery-speed ratio, remote-city × late (IBGE) | 0.441 | 0.760 | no gain from the same fix → **rethink** |
-| 3 | strategist re-plans: gradient boosting, 4 recipes, tuned cutoff | 0.495 | 0.769 | ranking OK → **model** |
-| 4 | ML engineer: more, smaller boosting steps (500 iterations, lower learning rate) | **0.499** | 0.768 | ranking OK → **model** |
-| 5 | ML engineer: same again (700 iterations) | 0.496 | 0.769 | budget spent → **finish** |
+| 1 | strategist plans gradient boosting with all 7 recipes (incl. IBGE `remote_city_x_late`, `distance_bands`) and an F1-tuned cutoff | **0.495** | 0.769 | ranking OK → judge picks **model** |
+| 2 | ML engineer: smaller, more boosting steps (learning rate 0.035, 500 iterations) | 0.496 | 0.770 | only +0.001 from the same kind of fix → judge picks **rethink** |
+| 3 | strategist re-plans: random forest with the same features | 0.487 | 0.760 | 2 cycles without improvement → **finish** (plateau: early stop after 3 of 5 cycles) |
+
+The best configuration is cycle 1: cycle 2's +0.001 is below the 0.002 improvement threshold.
 
 ![Final evaluation on the sealed holdout vs Part 1 baselines](docs/images/olist/olist-agent-final-eval.png)
 
-**Sealed holdout** (19,165 orders; best configuration = cycle 4):
+**Sealed holdout** (19,165 orders; best configuration = cycle 1):
 
 | Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
 |---|---|---|---|---|---|
 | Majority class | 0.872 | 0.000 | 0.000 | 0.000 | 0.500 |
 | Airflow logistic regression (Part 1) | 0.809 | 0.347 | 0.559 | 0.428 | 0.755 |
 | Airflow random forest (Part 1) | 0.866 | 0.477 | 0.472 | **0.475** | 0.760 |
-| **Agent loop: gradient boosting** | **0.879** | **0.535** | 0.421 | 0.471 | **0.772** |
+| **Agent loop: gradient boosting** | **0.875** | **0.512** | 0.431 | 0.468 | **0.771** |
 
-Confusion matrix on the holdout: **1,034** bad reviews caught, 1,420 missed, 900 false alarms out
-of 16,711 good orders.
+Confusion matrix on the holdout: **1,058** bad reviews caught, 1,396 missed, 1,010 false alarms
+out of 16,711 good orders.
 
-**How to read this for the support use case:** among orders the model flags, **53.5% really do get
+**How to read this for the support use case:** among orders the model flags, **51.2% really do get
 a bad review**, versus 12.8% for an order picked at random. That's about a 4× better hit rate for
 the support team's outreach.
 
@@ -392,13 +392,14 @@ are stratified and the same size, but they aren't the same rows.
    15–16% bad reviews versus 11% nearby, and their orders are late twice as often.
 3. **Accuracy is the wrong metric.** "Always good" scores 87% accuracy. F1 and ROC-AUC separate
    the models.
-4. **The diagnosis routing found the improvements.**
-   - Adding features didn't help the linear model (cycles 1–2), so the router triggered a
-     **rethink**.
-   - The re-plan to gradient boosting with a tuned cutoff jumped validation F1 from 0.441 to 0.495.
-   - From there, **model**-route tuning added a little more.
-   - The final model has the best ROC-AUC (0.772) and precision (0.535) of all models, while F1
-     ties the Part 1 random forest (0.471 vs 0.475).
+4. **The routing behaved as designed.**
+   - The LLM strategist started strong: gradient boosting with all feature recipes reached
+     validation F1 0.495, already above Airflow's 0.475.
+   - Tuning the cutoff and capacity (**model** route) added only +0.001, so the judge chose a
+     **rethink**. The re-plan (random forest) did worse, and the **plateau rule stopped the run
+     after 3 of 5 cycles** instead of spending the rest of the budget.
+   - The final model has the best ROC-AUC (0.771), precision (0.512) and accuracy (0.875) of all
+     models. Its F1 (0.468) is essentially tied with the Part 1 random forest (0.475).
 5. **There's a ceiling around F1 ≈ 0.5.** The data explains delivery-driven dissatisfaction well,
    but product quality and buyer expectations aren't observed. The plateau rule stops the loop
    when it stops improving instead of wasting cycles.
